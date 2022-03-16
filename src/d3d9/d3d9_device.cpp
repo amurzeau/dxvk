@@ -870,7 +870,10 @@ namespace dxvk {
     if (dstTexInfo->Desc()->Pool == D3DPOOL_DEFAULT)
       return this->StretchRect(pRenderTarget, nullptr, pDestSurface, nullptr, D3DTEXF_NONE);
 
-    Rc<DxvkBuffer> dstBuffer = dstTexInfo->GetBuffer(dst->GetSubresource());
+    VkExtent3D dstTexExtent = dstTexInfo->GetExtentMip(dst->GetMipLevel());
+    VkExtent3D srcTexExtent = srcTexInfo->GetExtentMip(src->GetMipLevel());
+
+    Rc<DxvkBuffer> dstBuffer = dstTexInfo->GetBuffer(dst->GetSubresource(), dstTexExtent.width > srcTexExtent.width || dstTexExtent.height > srcTexExtent.height);
 
     Rc<DxvkImage>  srcImage                 = srcTexInfo->GetImage();
     const DxvkFormatInfo* srcFormatInfo     = imageFormatInfo(srcImage->info().format);
@@ -881,9 +884,8 @@ namespace dxvk {
       srcSubresource.mipLevel,
       srcSubresource.arrayLayer, 1 };
 
-    VkExtent3D srcExtent = srcTexInfo->GetExtentMip(src->GetMipLevel());
 
-    VkExtent3D texLevelExtentBlockCount = util::computeBlockCount(srcExtent, srcFormatInfo->blockSize);
+    VkExtent3D texLevelExtentBlockCount = util::computeBlockCount(srcTexExtent, srcFormatInfo->blockSize);
     VkDeviceSize pitch = align(texLevelExtentBlockCount.width * uint32_t(srcFormatInfo->elementSize), 4);
     uint32_t pitchBlocks = uint32_t(pitch / srcFormatInfo->elementSize);
     VkExtent2D dstExtent = VkExtent2D{ pitchBlocks,
@@ -893,7 +895,7 @@ namespace dxvk {
       cBuffer       = dstBuffer,
       cImage        = srcImage,
       cSubresources = srcSubresourceLayers,
-      cLevelExtent  = srcExtent,
+      cLevelExtent  = srcTexExtent,
       cDstExtent    = dstExtent
     ] (DxvkContext* ctx) {
       ctx->copyImageToBuffer(cBuffer, 0, 4, 0,
@@ -4148,10 +4150,6 @@ namespace dxvk {
 
     auto& desc = *(pResource->Desc());
 
-    bool alloced = pResource->CreateBufferSubresource(Subresource);
-
-    const Rc<DxvkBuffer> mappedBuffer = pResource->GetBuffer(Subresource);
-
     auto& formatMapping = pResource->GetFormatMapping();
 
     const DxvkFormatInfo* formatInfo = formatMapping.IsValid()
@@ -4202,12 +4200,14 @@ namespace dxvk {
     bool needsReadback = pResource->NeedsReachback(Subresource) || renderable;
     pResource->SetNeedsReadback(Subresource, false);
 
-    DxvkBufferSliceHandle physSlice;
+    void* mapPtr;
 
     if ((Flags & D3DLOCK_DISCARD) && needsReadback) {
       // We do not have to preserve the contents of the
       // buffer if the entire image gets discarded.
-      physSlice = pResource->DiscardMapSlice(Subresource);
+      const Rc<DxvkBuffer> mappedBuffer = pResource->GetBuffer(Subresource, false);
+      DxvkBufferSliceHandle physSlice = pResource->DiscardMapSlice(Subresource);
+      mapPtr = physSlice.mapPtr;
 
       EmitCs([
         cImageBuffer = std::move(mappedBuffer),
@@ -4216,10 +4216,15 @@ namespace dxvk {
         ctx->invalidateBuffer(cImageBuffer, cBufferSlice);
       });
     } else {
-      physSlice = pResource->GetMappedSlice(Subresource);
+      if (unlikely(pResource->GetMapMode() == D3D9_COMMON_TEXTURE_MAP_MODE_BACKED)) {
+        // Create mapping buffer if it doesn't exist yet. (POOL_DEFAULT)
+        pResource->GetBuffer(Subresource, !needsReadback);
+      }
+
+      mapPtr = pResource->GetData(Subresource);
 
       if (needsReadback) {
-        const Rc<DxvkBuffer> mappedBuffer = pResource->GetBuffer(Subresource);
+        const Rc<DxvkBuffer> mappedBuffer = pResource->GetBuffer(Subresource, false);
         if (unlikely(needsReadback) && pResource->GetImage() != nullptr) {
           Rc<DxvkImage> resourceImage = pResource->GetImage();
 
@@ -4294,8 +4299,6 @@ namespace dxvk {
 
         if (!WaitForResource(mappedBuffer, pResource->GetMappingBufferSequenceNumber(Subresource), Flags))
           return D3DERR_WASSTILLDRAWING;
-      } else if (alloced) {
-        std::memset(physSlice.mapPtr, 0, physSlice.length);
       }
     }
 
@@ -4352,8 +4355,7 @@ namespace dxvk {
       (!atiHack) ? formatInfo : nullptr,
       pBox);
 
-
-    uint8_t* data = reinterpret_cast<uint8_t*>(physSlice.mapPtr);
+    uint8_t* data = reinterpret_cast<uint8_t*>(mapPtr);
     data += offset;
     pLockedBox->pBits = data;
     return D3D_OK;
@@ -4439,7 +4441,6 @@ namespace dxvk {
 
     // Now that data has been written into the buffer,
     // we need to copy its contents into the image
-    const DxvkBufferSliceHandle srcSlice = pSrcTexture->GetMappedSlice(SrcSubresource);
 
     auto formatInfo  = imageFormatInfo(image->info().format);
     auto srcSubresource = pSrcTexture->GetSubresourceFromIndex(
@@ -4482,9 +4483,10 @@ namespace dxvk {
           + srcOffsetBlockCount.y * pitch
           + srcOffsetBlockCount.x * formatInfo->elementSize;
 
+      const void* mapPtr = pSrcTexture->GetData(SrcSubresource);
       VkDeviceSize dirtySize = extentBlockCount.width * extentBlockCount.height * extentBlockCount.depth * formatInfo->elementSize;
       D3D9BufferSlice slice = AllocTempBuffer<false>(dirtySize);
-      const void* srcData = reinterpret_cast<const uint8_t*>(srcSlice.mapPtr) + copySrcOffset;
+      const void* srcData = reinterpret_cast<const uint8_t*>(mapPtr) + copySrcOffset;
       util::packImageData(
         slice.mapPtr, srcData, extentBlockCount, formatInfo->elementSize,
         pitch, pitch * srcTexLevelExtentBlockCount.height);
@@ -4507,6 +4509,7 @@ namespace dxvk {
     }
     else {
       const DxvkFormatInfo* formatInfo = imageFormatInfo(pDestTexture->GetFormatMapping().FormatColor);
+      const void* mapPtr = pSrcTexture->GetData(SrcSubresource);
 
       // Add more blocks for the other planes that we might have.
       // TODO: PLEASE CLEAN ME
@@ -4524,11 +4527,11 @@ namespace dxvk {
       }
 
       // the converter can not handle the 4 aligned pitch so we always repack into a staging buffer
-      D3D9BufferSlice slice = AllocTempBuffer<false>(srcSlice.length);
+      D3D9BufferSlice slice = AllocTempBuffer<false>(pSrcTexture->GetMipSize(SrcSubresource));
       VkDeviceSize pitch = align(srcTexLevelExtentBlockCount.width * formatInfo->elementSize, 4);
 
       util::packImageData(
-        slice.mapPtr, srcSlice.mapPtr, srcTexLevelExtentBlockCount, formatInfo->elementSize,
+        slice.mapPtr, mapPtr, srcTexLevelExtentBlockCount, formatInfo->elementSize,
         pitch, std::min(convertFormat.PlaneCount, 2u) * pitch * srcTexLevelExtentBlockCount.height);
 
       Flush();
@@ -5313,7 +5316,7 @@ namespace dxvk {
 
   void D3D9DeviceEx::UploadManagedTexture(D3D9CommonTexture* pResource) {
     for (uint32_t subresource = 0; subresource < pResource->CountSubresources(); subresource++) {
-      if (!pResource->NeedsUpload(subresource) || pResource->GetBuffer(subresource) == nullptr)
+      if (!pResource->NeedsUpload(subresource))
         continue;
 
       this->FlushImage(pResource, subresource);
